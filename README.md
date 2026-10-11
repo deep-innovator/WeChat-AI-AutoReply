@@ -104,6 +104,22 @@ python wechat_bot_gui_dev.py
 python wechat_ai_bot_dev.py
 ```
 
+#### 5. OCR 模型（可选升级到 PP-OCRv6 medium）
+
+仓库已自带 **PP-OCRv6 small** 检测 + 识别模型（`models/` 目录，clone 即用，无需额外下载）。如需更高识别精度，可**可选**下载 **PP-OCRv6 medium** 模型覆盖升级：
+
+- **官方模型托管**：https://www.modelscope.cn/collections/PaddlePaddle/PP-OCRv6
+- 下载以下 2 个文件放入 `models/` 目录（与现有 small 模型同级）：
+
+| 文件 | 用途 | 大小 |
+| --- | --- | --- |
+| `PP-OCRv6_det_medium.onnx` | 文本检测（medium） | ~59 MB |
+| `PP-OCRv6_rec_medium.onnx` | 文字识别（medium） | ~73 MB |
+
+`wechat_ai_bot_dev.py` 启动时会**自动按 `medium → small → 包内默认` 的优先级加载**：检测到 medium 模型即用 medium，否则回退 small，无需改任何配置。识别字典 `ppocrv6_dict.txt` 已随仓库提供（medium 与 small 共用）。
+
+> 说明：medium 模型文件体积较大（合计约 132 MB），为避免拖慢仓库克隆未入库，请按需自行下载。
+
 ---
 
 ## ⚙️ 核心配置说明 (`wechat_config.json`)
