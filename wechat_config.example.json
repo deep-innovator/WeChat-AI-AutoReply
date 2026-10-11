@@ -39,6 +39,18 @@
         "相亲对象D": "温柔幽默模式：体贴细心、情商高、自然幽默、随和温暖",
         "默认": "真人好友模式：语气自然随和、口语化、真诚得体"
     },
+    "group_forward": {
+        "enabled": true,
+        "source_groups": [
+            "贝侃拼拼群"
+        ],
+        "watch_users": [
+            "远望"
+        ],
+        "target_group": "请填写目标转发群名",
+        "forward_with_name": true,
+        "forward_images_as_text": true
+    },
     "saved_window_rect": [
         100,
         100,

@@ -55,3 +55,5 @@ wechat_convo_map.json
 *.swo
 .DS_Store
 Thumbs.db
+# 大模型文件(medium, 需按README从modelscope下载)
+models/PP-OCRv6_*_medium.onnx

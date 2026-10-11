@@ -259,16 +259,19 @@ class WeChatBotGUI(tk.Tk):
         self.tab_engine = ttk.Frame(self.notebook, padding=12)
         self.tab_prompt = ttk.Frame(self.notebook, padding=12)
         self.tab_whitelist = ttk.Frame(self.notebook, padding=12)
+        self.tab_forward = ttk.Frame(self.notebook, padding=12)
         self.tab_test = ttk.Frame(self.notebook, padding=12)
 
         self.notebook.add(self.tab_engine, text=" ⚙️ AI 引擎设置 ")
         self.notebook.add(self.tab_prompt, text=" 🎭 人设与指令 Prompt ")
         self.notebook.add(self.tab_whitelist, text=" 🌓 白名单与防扰 ")
+        self.notebook.add(self.tab_forward, text=" 🔁 群聊监控转发 ")
         self.notebook.add(self.tab_test, text=" 🧪 AI 仿真测试沙盒 ")
 
         self.build_tab_engine()
         self.build_tab_prompt()
         self.build_tab_whitelist()
+        self.build_tab_forward()
         self.build_tab_test()
 
         # Bottom Log Viewer
@@ -423,6 +426,65 @@ class WeChatBotGUI(tk.Tk):
         ttk.Button(bl_ctrl, text="添加屏蔽", command=self.add_blacklist).pack(side=tk.LEFT, padx=2)
         ttk.Button(bl_ctrl, text="删除选中", command=self.del_blacklist).pack(side=tk.LEFT, padx=2)
 
+    # 3.5 TAB: 群聊监控转发 (Group Forward)
+    def build_tab_forward(self):
+        top_f = ttk.Frame(self.tab_forward)
+        top_f.pack(fill=tk.X, pady=(0, 6))
+
+        self.var_gf_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top_f, text="🔁 开启群聊监控转发（监听白名单群内指定成员发言，实时转发到目标群；开启后暂停好友 AI 回复）", variable=self.var_gf_enabled).pack(side=tk.LEFT)
+        ttk.Label(top_f, text="⚠️ 需先点击下方「保存配置」生效；保存后请重启守护进程", foreground="#c0392b", font=("微软雅黑", 8)).pack(side=tk.LEFT, padx=12)
+
+        # 目标群 + 昵称行
+        row_target = ttk.Frame(self.tab_forward)
+        row_target.pack(fill=tk.X, pady=4)
+        ttk.Label(row_target, text="目标群（消息转发到）:", width=18).pack(side=tk.LEFT)
+        self.ent_gf_target = ttk.Entry(row_target, width=30)
+        self.ent_gf_target.pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Label(row_target, text="自己的群昵称（自己发言也转发时填）:", width=28).pack(side=tk.LEFT)
+        self.ent_gf_self = ttk.Entry(row_target, width=18)
+        self.ent_gf_self.pack(side=tk.LEFT)
+
+        # 转发行为选项
+        row_opts = ttk.Frame(self.tab_forward)
+        row_opts.pack(fill=tk.X, pady=4)
+        self.var_gf_with_name = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row_opts, text="转发时带发言人昵称（如「远望：消息」）", variable=self.var_gf_with_name).pack(side=tk.LEFT, padx=(0, 24))
+        self.var_gf_img = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row_opts, text="图片消息 OCR 提取文字后转发（表情包自动不转发）", variable=self.var_gf_img).pack(side=tk.LEFT)
+
+        # 监控群 与 监听成员 双栏
+        mid_f = ttk.Frame(self.tab_forward)
+        mid_f.pack(fill=tk.BOTH, expand=True, pady=6)
+
+        left_f = ttk.LabelFrame(mid_f, text=" 🟢 监控群（白名单群聊，在此群内监听发言） ", padding=8)
+        left_f.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        self.listbox_gf_src = tk.Listbox(left_f, selectmode=tk.SINGLE, font=("微软雅黑", 9))
+        self.listbox_gf_src.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        gf_src_ctrl = ttk.Frame(left_f)
+        gf_src_ctrl.pack(fill=tk.X)
+        self.ent_add_gf_src = ttk.Entry(gf_src_ctrl)
+        self.ent_add_gf_src.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(gf_src_ctrl, text="添加群", command=self.add_forward_group).pack(side=tk.LEFT, padx=2)
+        ttk.Button(gf_src_ctrl, text="删除选中", command=self.del_forward_group).pack(side=tk.LEFT, padx=2)
+
+        right_f = ttk.LabelFrame(mid_f, text=" 🎯 监听发言人（群内指定成员，发言即转发） ", padding=8)
+        right_f.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        self.listbox_gf_watch = tk.Listbox(right_f, selectmode=tk.SINGLE, font=("微软雅黑", 9))
+        self.listbox_gf_watch.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        gf_watch_ctrl = ttk.Frame(right_f)
+        gf_watch_ctrl.pack(fill=tk.X)
+        self.ent_add_gf_watch = ttk.Entry(gf_watch_ctrl)
+        self.ent_add_gf_watch.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(gf_watch_ctrl, text="添加成员", command=self.add_watch_user).pack(side=tk.LEFT, padx=2)
+        ttk.Button(gf_watch_ctrl, text="删除选中", command=self.del_watch_user).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(self.tab_forward, text="💡 说明：监听群内成员发言后，消息【原样】转发到目标群（不经过 AI）。图片消息优先尝试转发原图，不能转发时 OCR 提取图片文字转发；纯表情消息自动跳过。", foreground="#666666", font=("微软雅黑", 8), wraplength=900).pack(fill=tk.X, pady=(4, 0))
+
+        btn_f = ttk.Frame(self.tab_forward)
+        btn_f.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btn_f, text="💾 保存群转发配置", command=self.save_ui_to_config).pack(side=tk.RIGHT)
+
     # 4. TAB: Test Sandbox
     def build_tab_test(self):
         ttk.Label(self.tab_test, text="🧪 模拟微信好友提问，测试当前 AI 引擎与 Prompt 的真实回复质量:", font=("微软雅黑", 9, "bold")).pack(anchor=tk.W, pady=(0, 6))
@@ -498,6 +560,24 @@ class WeChatBotGUI(tk.Tk):
         for b in c.get("blacklist", []):
             self.listbox_bl.insert(tk.END, b)
 
+        # 群聊监控转发
+        gf = c.get("group_forward") or {}
+        self.var_gf_enabled.set(bool(gf.get("enabled", False)))
+        self.var_gf_with_name.set(bool(gf.get("forward_with_name", False)))
+        self.var_gf_img.set(bool(gf.get("forward_images_as_text", True)))
+        self.ent_gf_target.delete(0, tk.END)
+        self.ent_gf_target.insert(0, gf.get("target_group") or "")
+        self.ent_gf_self.delete(0, tk.END)
+        self.ent_gf_self.insert(0, gf.get("self_nickname") or "")
+        self.listbox_gf_src.delete(0, tk.END)
+        for g in gf.get("source_groups") or []:
+            if g:
+                self.listbox_gf_src.insert(tk.END, g)
+        self.listbox_gf_watch.delete(0, tk.END)
+        for u in gf.get("watch_users") or []:
+            if u:
+                self.listbox_gf_watch.insert(tk.END, u)
+
     def save_ui_to_config(self, show_msg=True):
         self.config_data["ai_engine"] = self.var_engine.get()
         self.config_data["openai_api"] = {
@@ -523,6 +603,9 @@ class WeChatBotGUI(tk.Tk):
         self.config_data["whitelist_mode"] = self.var_wl_mode.get()
         self.config_data["whitelist"] = list(self.listbox_wl.get(0, tk.END))
         self.config_data["blacklist"] = list(self.listbox_bl.get(0, tk.END))
+
+        # 群聊监控转发
+        self.config_data["group_forward"] = self._gf_from_ui()
 
         if self.save_config():
             if show_msg:
@@ -595,6 +678,53 @@ class WeChatBotGUI(tk.Tk):
                 self.config_data["blacklist"].remove(val)
                 self.save_config()
             self.listbox_bl.delete(idx)
+
+    # ---- 群聊监控转发：监控群 / 监听成员 添加与删除 ----
+    def _gf_from_ui(self):
+        """从当前 UI 状态重建 group_forward 配置（添加/删除单项时整体落盘，避免旧快照覆盖）。"""
+        return {
+            "enabled": self.var_gf_enabled.get(),
+            "source_groups": [g for g in list(self.listbox_gf_src.get(0, tk.END)) if g and str(g).strip()],
+            "watch_users": [u for u in list(self.listbox_gf_watch.get(0, tk.END)) if u and str(u).strip()],
+            "target_group": self.ent_gf_target.get().strip(),
+            "forward_with_name": self.var_gf_with_name.get(),
+            "forward_images_as_text": self.var_gf_img.get(),
+            "self_nickname": self.ent_gf_self.get().strip(),
+        }
+
+    def add_forward_group(self):
+        val = self.ent_add_gf_src.get().strip()
+        if val:
+            if val not in list(self.listbox_gf_src.get(0, tk.END)):
+                self.listbox_gf_src.insert(tk.END, val)
+                self.config_data["group_forward"] = self._gf_from_ui()
+                self.save_config()
+            self.ent_add_gf_src.delete(0, tk.END)
+
+    def del_forward_group(self):
+        sel = self.listbox_gf_src.curselection()
+        if sel:
+            idx = sel[0]
+            self.listbox_gf_src.delete(idx)
+            self.config_data["group_forward"] = self._gf_from_ui()
+            self.save_config()
+
+    def add_watch_user(self):
+        val = self.ent_add_gf_watch.get().strip()
+        if val:
+            if val not in list(self.listbox_gf_watch.get(0, tk.END)):
+                self.listbox_gf_watch.insert(tk.END, val)
+                self.config_data["group_forward"] = self._gf_from_ui()
+                self.save_config()
+            self.ent_add_gf_watch.delete(0, tk.END)
+
+    def del_watch_user(self):
+        sel = self.listbox_gf_watch.curselection()
+        if sel:
+            idx = sel[0]
+            self.listbox_gf_watch.delete(idx)
+            self.config_data["group_forward"] = self._gf_from_ui()
+            self.save_config()
 
     def run_sandbox_test(self):
         sender = self.ent_test_sender.get().strip() or "测试好友"

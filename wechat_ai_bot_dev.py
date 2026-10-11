@@ -82,13 +82,29 @@ def init_ocr():
     if not os.path.exists(models_dir):
         models_dir = os.path.join(BASE_DIR, "_internal", "models")
     
-    det_model = os.path.join(models_dir, "ch_PP-OCRv4_det_infer.onnx")
-    cls_model = os.path.join(models_dir, "ch_ppocr_mobile_v2.0_cls_infer.onnx")
-    rec_model = os.path.join(models_dir, "ch_PP-OCRv4_rec_infer.onnx")
+    # PP-OCRv6 优先（百度 2026 新一代通用 OCR，识别精度大幅超越 v4，需配套字典）。
+    # 优先级：medium（最高精度）→ small（更快）→ v4 回退。
+    # 方向分类模型 (cls) 不传路径，使用 rapidocr 包内置默认模型（与 v6 兼容）。
+    v6_candidates = [
+        ("PP-OCRv6_det_medium.onnx", "PP-OCRv6_rec_medium.onnx"),
+        ("PP-OCRv6_det_small.onnx", "PP-OCRv6_rec_small.onnx"),
+    ]
+    v6_keys = os.path.join(models_dir, "ppocrv6_dict.txt")
+    for v6_det_name, v6_rec_name in v6_candidates:
+        v6_det = os.path.join(models_dir, v6_det_name)
+        v6_rec = os.path.join(models_dir, v6_rec_name)
+        if os.path.exists(v6_det) and os.path.exists(v6_rec) and os.path.exists(v6_keys):
+            try:
+                return RapidOCR(det_model_path=v6_det, rec_model_path=v6_rec, rec_keys_path=v6_keys)
+            except Exception:
+                pass
     
+    # 回退 PP-OCRv4
+    det_model = os.path.join(models_dir, "ch_PP-OCRv4_det_infer.onnx")
+    rec_model = os.path.join(models_dir, "ch_PP-OCRv4_rec_infer.onnx")
     if os.path.exists(det_model) and os.path.exists(rec_model):
         try:
-            return RapidOCR(det_model_path=det_model, cls_model_path=cls_model, rec_model_path=rec_model)
+            return RapidOCR(det_model_path=det_model, rec_model_path=rec_model)
         except Exception:
             pass
     return RapidOCR()
@@ -369,7 +385,12 @@ def normalize_for_match(text):
     t_clean = re.sub(r'[\^_\~\-\.\,\'\"\`\*\#\@\!\:\;\|\/\\]', '', t)
     return t_clean
 
-def is_name_matched_strict(contact_name, whitelist):
+def is_name_matched_strict(contact_name, whitelist, allow_group=False):
+    """
+    联系人名字严格匹配（白名单/群名通用）。
+    allow_group=True 时跳过群聊防火墙（用于群转发模式的群名匹配），
+    其余场景保持默认防火墙行为，杜绝误匹配群聊。
+    """
     if not contact_name or len(str(contact_name).strip()) < 2:
         return False, ""
 
@@ -381,11 +402,13 @@ def is_name_matched_strict(contact_name, whitelist):
         raw_variants.append(stripped)
 
     for r in raw_variants:
-        # 群聊与非白名单防火墙：只检测"名字段"(会话行可能携带消息预览，
-        # 预览里的括号数字如 "一共(3)个文件" 不应误伤真实好友)
-        name_seg = re.split(r'\s+', r, maxsplit=1)[0]
-        if re.search(r'[\(（]\d+[\)）](\s|$)|\[\d+条\]|群聊|交流群|互助群|通知群|工作群|家族群|同乡群|部门群', name_seg):
-            return False, ""
+        # 群聊与非白名单防火墙：默认只检测"名字段"(会话行可能携带消息预览，
+        # 预览里的括号数字如 "一共(3)个文件" 不应误伤真实好友)。
+        # 群转发模式 (allow_group=True) 明确放行群名。
+        if not allow_group:
+            name_seg = re.split(r'\s+', r, maxsplit=1)[0]
+            if re.search(r'[\(（]\d+[\)）](\s|$)|\[\d+条\]|群聊|交流群|互助群|通知群|工作群|家族群|同乡群|部门群', name_seg):
+                return False, ""
 
     for r in raw_variants:
         norm_ocr = normalize_for_match(r)
@@ -503,11 +526,13 @@ def parse_chat_bubbles_chromatic(res, img_rgb, layout, ignored_keywords=None):
             continue
             
         # 排除顶栏乱码与非聊天文字 (纯数字如 666, 1, 520, 21 等 100% 完整保留支持)
-        if any(bad in c_clean for bad in ["P以H白", "y< o O", "查看更多", "以下为新消息", "置顶聊天"]):
+        if any(bad in c_clean for bad in ["P以H白", "y< o O", "查看更多", "以下为新消息", "以下是新消息", "置顶聊天"]):
             continue
         
-        # 严格限定在主聊天气泡区域 (顶部避开标题栏 + 15px，底部避开输入工具栏)
-        if cx > (chat_start_x + 15) and (header_h + 15) < cy < (H - int(input_h * 0.70)):
+        # 严格限定在主聊天气泡区域 (顶部避开标题栏，底部避开输入工具栏)
+        # 注意：微信群聊 incoming 消息是"昵称行(小字)+内容行"两行，昵称行紧贴聊天区顶部，
+        # 顶部过滤必须只排除标题栏本身（header_h），否则顶部第一条消息的昵称会被误删
+        if cx > (chat_start_x + 15) and header_h < cy < (H - int(input_h * 0.70)):
             if re.match(r'^\d{1,2}:\d{2}$', c_clean) or re.match(r'^\d{1,2}/\d{2}$', c_clean) or re.match(r'^\d{4}-\d{2}-\d{2}', c_clean):
                 continue
             if c_clean in ["昨天", "前天", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日", "查看更多消息", "重新编辑", "发送"]:
@@ -536,22 +561,49 @@ def parse_chat_bubbles_chromatic(res, img_rgb, layout, ignored_keywords=None):
             raw_lines.append((cy, box_left, box_right, is_incoming, c_clean))
             
     raw_lines.sort(key=lambda x: x[0])
-    
-    # 智能多行气泡垂直合并 (< 40px)
+
+    # 智能多行气泡垂直合并：
+    # - 微信群聊 incoming = "昵称行(短文本) + 内容行"，间距 ~45-65px，合并为"昵称：内容"
+    # - 多行内容气泡间距 <40px，合并为"文本，文本"
     merged_bubbles = []
     for cy, b_left, b_right, is_inc, text in raw_lines:
-        if merged_bubbles and is_inc == merged_bubbles[-1]['is_incoming'] and abs(cy - merged_bubbles[-1]['last_y']) < 40:
-            merged_bubbles[-1]['text'] += "，" + text
-            merged_bubbles[-1]['last_y'] = cy
-        else:
-            merged_bubbles.append({
-                'is_incoming': is_inc,
-                'first_y': cy,
-                'last_y': cy,
-                'text': text
-            })
+        if merged_bubbles and is_inc == merged_bubbles[-1]['is_incoming']:
+            gap = cy - merged_bubbles[-1]['last_y']
+            last_text = merged_bubbles[-1]['text']
+            # 上行像昵称（短、无冒号/句号/标点）且间距在 65px 内 → 昵称：内容
+            if _looks_like_nickname(last_text) and gap < 65:
+                merged_bubbles[-1]['text'] = last_text + "：" + text
+                merged_bubbles[-1]['last_y'] = cy
+                continue
+            if gap < 40:
+                merged_bubbles[-1]['text'] += "，" + text
+                merged_bubbles[-1]['last_y'] = cy
+                continue
+        merged_bubbles.append({
+            'is_incoming': is_inc,
+            'first_y': cy,
+            'last_y': cy,
+            'text': text
+        })
             
     return merged_bubbles
+
+NICKNAME_MAX_LEN = 8
+
+def _looks_like_nickname(text):
+    """判定文本是否像群聊昵称行（短、无冒号、无句号/标点/表情占位）。"""
+    t = str(text).strip()
+    if not t:
+        return False
+    if len(t) > NICKNAME_MAX_LEN:
+        return False
+    if "：" in t or ":" in t:
+        return False
+    if re.search(r'[，。！？!?、…·—【】]', t):
+        return False
+    if t.startswith("[") or t.endswith("]"):
+        return False
+    return True
 
 def extract_pending_incoming_messages(chat_bubbles):
     """
@@ -747,7 +799,7 @@ def safe_clipboard_copy(text, retries=3, delay=0.03):
                 time.sleep(delay)
     return False
 
-def send_reply_instant(hwnd, rect, layout, target, final_reply):
+def send_reply_instant(hwnd, rect, layout, target, final_reply, allow_group=False):
     """
     极速秒回直达引擎（局部消息投递，0 弹窗 0 鼠标物理移动）：
     1. 预检当前顶栏目标并智能纠偏
@@ -757,6 +809,7 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
     5. Ctrl+V 与 Enter 极速注入
     6. 平稳切回用户原窗口 (彻底废除 HWND_BOTTOM 压底)
     7. 动态差分绿底增量严谨闭环验收
+    allow_group=True 时目标允许为群名（群转发模式），跳过群聊防火墙。
     """
     # --- 发送前核验 (Pre-Flight Verification) ---
     img_now, cur_rect, cur_scale = grab_wechat_window(hwnd)
@@ -781,9 +834,9 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
         res_now, _ = ocr_engine(img_now)
         
     cur_title = extract_active_chat_title(res_now, cur_layout)
-    is_right_target = is_name_matched_strict(cur_title, [target])[0] if cur_title else False
+    is_right_target = is_name_matched_strict(cur_title, [target], allow_group=allow_group)[0] if cur_title else False
     
-    # 若顶栏不是目标好友，触发智能重定向
+    # 若顶栏不是目标会话，触发智能重定向
     if not is_right_target:
         log(f"⚠️ [发送前纠偏] 检测到窗口偏离（当前为【{cur_title or '非目标'}】），正在重定向锁定【{target}】...")
         found_cand_y = None
@@ -793,13 +846,29 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
             cx = (b[0][0] + b[1][0]) / 2.0
             cy = (b[0][1] + b[2][1]) / 2.0
             if sidebar_w <= cx <= chat_start_x and (cur_layout["header_h"] + 5) <= cy <= (cur_H - 20):
-                if is_name_matched_strict(txt.strip(), [target])[0]:
+                if is_name_matched_strict(txt.strip(), [target], allow_group=allow_group)[0]:
                     found_cand_y = cy
                     break
                     
         if found_cand_y is not None:
-            post_click_client_point(hwnd, int(0.16 * cur_W), int(found_cand_y))
-            time.sleep(0.10)
+            # 点击前穿透激活 + 点击后等待 Qt 切换动画并验证顶栏，防串发到当前群
+            activate_wechat(hwnd)
+            time.sleep(0.05)
+            title_c = cur_title
+            switched = False
+            for _ in range(2):
+                post_click_client_point(hwnd, int(0.16 * cur_W), int(found_cand_y))
+                time.sleep(0.9)
+                img_c, _, layout_c, res_c = grab_and_ocr_wechat(hwnd)
+                if not img_c:
+                    continue
+                title_c = extract_active_chat_title(res_c, layout_c)
+                if title_c and is_name_matched_strict(title_c, [target], allow_group=allow_group)[0]:
+                    switched = True
+                    break
+            if not switched:
+                log(f"🚫 [安全熔断] 重定向点击后未确认切换到【{target}】（顶栏仍为【{title_c or '?'}】），放弃发送防串群！")
+                return False
             log(f"🎯 [后台静默纠偏] 已重新切入【{target}】聊天视窗")
         else:
             log(f"🚫 [安全熔断] 未在列表中定位到目标【{target}】，放弃本次发送以防串发！")
@@ -1160,6 +1229,355 @@ def scan_and_reply_wechat(hwnd):
             return
 
 # =============================================================================
+# 7.5 GROUP FORWARD ENGINE (群聊监控转发引擎)
+#     监控白名单群聊 -> 识别指定发言人新消息 -> 实时转发到目标群
+#     图片消息降级方案：裁剪图片区域 OCR 提取图片内文字后转发
+# =============================================================================
+GROUP_FORWARD_SIGNATURE = {}
+# 每个监控群已见气泡文本指纹集合 + 基线标记：
+# 指纹方案不依赖滚动位置（游标方案在窗口滚动时会漏掉中部新消息），
+# 每轮对比屏幕气泡文本，出现新文本即新消息；滚动重复看到的旧文本自动跳过。
+GROUP_FORWARD_SEEN = {}
+GROUP_FORWARD_INIT = {}
+
+# 表情消息过滤：小于该高度的无文本区域视为表情包，不转发（微信图片消息通常更高）
+EMOJI_REGION_MAX_H = 130
+# 纯表情占位文本（如 [表情] [微笑] [动画表情]）
+EMOJI_PLACEHOLDER_RE = re.compile(r'^\[[^\[\]]{1,12}\]$')
+
+def is_emoji_placeholder(text):
+    """判定消息文本是否为纯表情占位（如 [表情] [微笑] [动画表情]），是则跳过转发。"""
+    if not text:
+        return False
+    t = str(text).strip()
+    return bool(EMOJI_PLACEHOLDER_RE.match(t))
+
+def extract_sender_and_content(bubble_text):
+    """
+    从群聊气泡文本解析 (发言昵称, 消息内容)。
+    微信群聊消息气泡通常为 "昵称：内容" 格式。
+    解析失败返回 (None, 原文)，交由调用方按整条匹配处理。
+    """
+    if not bubble_text:
+        return None, ""
+    t = str(bubble_text).strip()
+    m = re.match(r'^([\u4e00-\u9fffA-Za-z0-9_\-\.·\s]{1,30}?)[:：]\s*[，,]?\s*(.*)$', t)
+    if m:
+        sender = m.group(1).strip()
+        content = m.group(2).strip()
+        return (sender, content) if sender else (None, t)
+    return None, t
+
+def match_watch_user(sender, full_text, watch_users):
+    """返回命中的监控昵称（配置中的原样昵称），未命中返回 None。
+    优先用解析出的发言昵称精确/前缀匹配；解析失败时用整条文本前缀匹配。"""
+    if not watch_users:
+        return None
+    candidates = []
+    if sender:
+        candidates.append(sender)
+    if full_text:
+        candidates.append(str(full_text).strip())
+    for cand in candidates:
+        if not cand:
+            continue
+        for u in watch_users:
+            if not u:
+                continue
+            if cand == u or cand.startswith(u) or normalize_for_match(cand) == normalize_for_match(u):
+                return u
+    return None
+
+def grab_and_ocr_wechat(hwnd):
+    """截屏 + 动态下采样 OCR，返回 (img, rect, layout, res)。失败返回 (None, None, None, None)"""
+    img, rect, scale = grab_wechat_window(hwnd)
+    if not img:
+        return None, None, None, None
+    W, H = img.size
+    if W <= 100 or H <= 100:
+        return None, None, None, None
+    layout = compute_wechat_layout(W, H)
+    target_w = 1000
+    downscale_ratio = 1000.0 / W if W > 1100 else 1.0
+    if downscale_ratio < 1.0:
+        target_h = int(H * downscale_ratio)
+        img_for_ocr = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+        res_raw, _ = ocr_engine(img_for_ocr)
+        res = []
+        for b, txt, sc in (res_raw or []):
+            mapped_box = [[pt[0] / downscale_ratio, pt[1] / downscale_ratio] for pt in b]
+            res.append((mapped_box, txt, sc))
+    else:
+        res, _ = ocr_engine(img)
+    return img, rect, layout, res
+
+def switch_to_session(hwnd, layout, res, img, session_name):
+    """在左侧会话列表点击指定会话（群名/好友名），点击后等待 Qt 切换动画并二次验证顶栏。
+    返回是否确认切换成功（失败会重试一次）。"""
+    W, H = img.size
+    sidebar_w = layout["sidebar_w"]
+    chat_start_x = layout["chat_start_x"]
+    header_h = layout["header_h"]
+
+    def _find_candidate_y():
+        for b, txt, sc in (res or []):
+            cx = (b[0][0] + b[1][0]) / 2.0
+            cy = (b[0][1] + b[2][1]) / 2.0
+            if sidebar_w <= cx <= chat_start_x and (header_h + 5) <= cy <= (H - 20):
+                if is_name_matched_strict(txt.strip(), [session_name], allow_group=True)[0]:
+                    return cy
+        return None
+
+    found_cand_y = _find_candidate_y()
+    if found_cand_y is None:
+        return False
+    # 点击前必须穿透激活微信窗口——失焦时 Qt 会丢弃注入的鼠标消息
+    activate_wechat(hwnd)
+    time.sleep(0.05)
+    for attempt in range(2):
+        post_click_client_point(hwnd, int(0.16 * W), int(found_cand_y))
+        # Qt 会话切换有动画延迟：0.35s 内顶栏可能尚未刷新，必须等足 1s 再验证
+        time.sleep(1.0)
+        img_v, _, layout_v, res_v = grab_and_ocr_wechat(hwnd)
+        if not img_v:
+            continue
+        title_v = extract_active_chat_title(res_v, layout_v)
+        if title_v and is_name_matched_strict(title_v, [session_name], allow_group=True)[0]:
+            return True
+        # 重试前重新定位（会话列表可能因滚动变化）
+        found_cand_y = _find_candidate_y()
+        if found_cand_y is None:
+            return False
+    return False
+
+def detect_image_regions(img, res, layout):
+    """检测聊天区内未被 OCR 文本覆盖的大块图片区域，返回 [(中心y, 区域高度), ...]。
+    高度用于区分图片消息与表情包（表情包通常更矮）。"""
+    arr = np.array(img)
+    H, W = arr.shape[:2]
+    chat_x1 = layout["chat_start_x"] + 20
+    chat_x2 = W - 20
+    y1 = layout["header_h"] + 15
+    y2 = H - int(layout["input_h"] * 0.70)
+    if y2 <= y1 or chat_x2 <= chat_x1:
+        return []
+    mask = np.zeros((H, W), dtype=bool)
+    for b, txt, sc in (res or []):
+        xs = [pt[0] for pt in b]
+        ys = [pt[1] for pt in b]
+        xa = max(0, int(min(xs)) - 8)
+        xb = min(W, int(max(xs)) + 8)
+        ya = max(0, int(min(ys)) - 8)
+        yb = min(H, int(max(ys)) + 8)
+        mask[ya:yb, xa:xb] = True
+    regions = []
+    run_start = None
+    for yy in range(y1, y2, 12):
+        row_patch = arr[max(0, yy - 4):min(H, yy + 4), chat_x1:chat_x2]
+        if row_patch.size == 0:
+            continue
+        text_ratio = mask[yy, chat_x1:chat_x2].mean()
+        color_var = row_patch.reshape(-1, 3).astype(int).std()
+        if text_ratio < 0.35 and color_var > 25:
+            if run_start is None:
+                run_start = yy
+        else:
+            if run_start is not None and (yy - run_start) >= 90:
+                regions.append((run_start + (yy - run_start) // 2, yy - run_start))
+            run_start = None
+    if run_start is not None and (y2 - run_start) >= 90:
+        regions.append((run_start + (y2 - run_start) // 2, y2 - run_start))
+    merged = []
+    for ry, rh in regions:
+        if merged and abs(ry - merged[-1][0]) < 60:
+            # 相邻区域合并时高度取较大值
+            merged[-1] = (merged[-1][0], max(merged[-1][1], rh))
+            continue
+        merged.append((ry, rh))
+    return merged
+
+def ocr_image_region_text(img, layout, y_center):
+    """裁剪图片消息区域并 OCR 提取图片内文字（图片转发降级方案）。"""
+    x1 = layout["chat_start_x"] + 30
+    x2 = img.width - 30
+    y1 = max(0, y_center - 70)
+    y2 = min(img.height, y_center + 70)
+    if x2 <= x1 or y2 <= y1:
+        return ""
+    crop = img.crop((x1, y1, x2, y2))
+    res, _ = ocr_engine(crop)
+    texts = [txt.strip() for b, txt, sc in (res or []) if txt and txt.strip()]
+    return "，".join(texts)
+
+def _retry_ocr_line(img, layout, y_center):
+    """OCR 漏读内容补偿：按消息行区域裁剪并放大 2 倍重新识别。
+    单字/极短消息（如"在""好"）常被全局下采样 OCR 漏读，此处局部放大补救。"""
+    x1 = layout["chat_start_x"] + 30
+    x2 = img.width - 30
+    y1 = max(0, y_center - 25)
+    y2 = min(img.height, y_center + 25)
+    if x2 <= x1 or y2 <= y1:
+        return ""
+    crop = img.crop((x1, y1, x2, y2))
+    crop = crop.resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS)
+    res, _ = ocr_engine(crop)
+    texts = [txt.strip() for b, txt, sc in (res or []) if txt and txt.strip()]
+    return "，".join(texts)
+
+def forward_group_messages(hwnd):
+    """
+    群聊监控转发引擎主入口（每轮仅处理一个监控群，轮询调度）：
+    1. 读取 group_forward 配置；未启用/配置不全直接返回
+    2. 切换到监控群（切换后二次验证顶栏）-> OCR 解析气泡
+    3. 自基线后所有新气泡（文本指纹去重，不依赖滚动位置；含自己发的绿泡）：
+       - incoming（别人发）：解析"昵称：内容"匹配 watch_users
+       - outgoing（自己发绿泡）：发言人为 self_nickname，需在监控名单才转发
+    4. 文本消息直接转发；图片消息区域裁剪 OCR 提取文字后转发（表情包过滤）
+    5. 转发复用 send_reply_instant（目标群名匹配已开 allow_group）
+    """
+    global LAST_CHAT_HASH, LAST_SIDEBAR_HASH, LAST_FULL_SCAN_TIME
+    ensure_default_desktop()
+    cfg = load_config()
+    gf = cfg.get("group_forward") or {}
+    if not gf.get("enabled"):
+        return
+    source_groups = [g.strip() for g in (gf.get("source_groups") or []) if g and str(g).strip()]
+    watch_users = [u.strip() for u in (gf.get("watch_users") or []) if u and str(u).strip()]
+    target_group = str(gf.get("target_group") or "").strip()
+    forward_with_name = bool(gf.get("forward_with_name", True))
+    forward_images_as_text = bool(gf.get("forward_images_as_text", True))
+    # 自己的群昵称：用于识别自己发的绿泡消息（绿泡无昵称，只有自己能确认归属）
+    self_nickname = str(gf.get("self_nickname") or "").strip()
+    if not source_groups or not watch_users or not target_group:
+        log("⚠️ [群转发] 配置不完整：需同时填写 source_groups / watch_users / target_group，当前已跳过")
+        return
+
+    img, rect, layout, res = grab_and_ocr_wechat(hwnd)
+    if not img or not res:
+        return
+    W, H = img.size
+
+    for src_group in source_groups:
+        # 1. 确保当前窗口为该监控群（切换后二次验证顶栏，防点击失败误读其他会话）
+        cur_title = extract_active_chat_title(res, layout)
+        if not (cur_title and is_name_matched_strict(cur_title, [src_group], allow_group=True)[0]):
+            if not switch_to_session(hwnd, layout, res, img, src_group):
+                log(f"⚠️ [群转发] 左侧会话列表未找到监控群【{src_group}】（可能被折叠/未显示），本轮跳过")
+                continue
+            img2, rect2, layout2, res2 = grab_and_ocr_wechat(hwnd)
+            if not img2 or not res2:
+                continue
+            img, rect, layout, res = img2, rect2, layout2, res2
+            W, H = img.size
+            title2 = extract_active_chat_title(res, layout)
+            if not (title2 and is_name_matched_strict(title2, [src_group], allow_group=True)[0]):
+                log(f"⚠️ [群转发] 切换到监控群【{src_group}】后顶栏未确认（当前【{title2 or '?'}】），本轮跳过防误读")
+                continue
+
+        chat_bubbles = parse_chat_bubbles_chromatic(res, img, layout, cfg.get("ignored_keywords", []))
+        if not chat_bubbles:
+            continue
+
+        # 首次运行（或重启后）：建立文本指纹基线，只记录当前屏幕所有气泡，不转发历史消息防刷屏
+        seen = GROUP_FORWARD_SEEN.setdefault(src_group, set())
+        if src_group not in GROUP_FORWARD_INIT:
+            GROUP_FORWARD_INIT[src_group] = True
+            for pb in chat_bubbles:
+                t = pb['text'].strip()
+                if t:
+                    seen.add(t)
+            log(f"📌 [群转发] 监控群【{src_group}】指纹基线已建立（{len(seen)} 条已见消息），之后的新消息才会转发")
+            break
+
+        # 本轮新气泡 = 指纹未见过（含自己发的绿泡；滚动重复看到的旧文本自动跳过）
+        new_bubbles = []
+        for pb in chat_bubbles:
+            t = pb['text'].strip()
+            if not t:
+                continue
+            if t in seen:
+                continue
+            seen.add(t)
+            new_bubbles.append(pb)
+        new_bubbles.sort(key=lambda x: x['last_y'])
+
+        # 2. 文本消息转发（签名去重）
+        for pb in new_bubbles:
+            text = pb['text'].strip()
+            if not text:
+                continue
+            if pb['is_incoming']:
+                # 别人发的消息：解析"昵称：内容"匹配监控名单
+                sender, content = extract_sender_and_content(text)
+                matched_user = match_watch_user(sender, content or text, watch_users)
+                if not matched_user:
+                    continue
+                if content:
+                    forward_content = content
+                else:
+                    # OCR 漏读补偿：内容为空时对消息行区域放大 2x 重新识别（单字/短消息常被下采样漏读）
+                    retried = _retry_ocr_line(img, layout, pb['last_y'])
+                    if retried:
+                        r_sender, r_content = extract_sender_and_content(retried)
+                        forward_content = r_content or retried
+                    else:
+                        log(f"⏭️ [群转发] OCR 未读取到【{matched_user}】消息内容（原文: {text}），本轮跳过等待重读")
+                        continue
+            else:
+                # 自己发的绿泡（无昵称）：发言人为 self_nickname，仅当其在监控名单时转发
+                if not self_nickname or not match_watch_user(self_nickname, None, watch_users):
+                    log(f"⏭️ [群转发] 检测到自己发言（绿泡），但 self_nickname 未配置或不在监控名单，跳过")
+                    continue
+                matched_user = self_nickname
+                forward_content = text
+            sig = (src_group, matched_user, forward_content)
+            if GROUP_FORWARD_SIGNATURE.get(sig):
+                continue
+            # 表情消息过滤：纯表情占位（如 [表情] [微笑] [动画表情]）不转发
+            if is_emoji_placeholder(forward_content):
+                log(f"⏭️ [群转发] 【{matched_user}】发送的是表情消息（{forward_content}），跳过不转发")
+                continue
+            GROUP_FORWARD_SIGNATURE[sig] = True
+            forward_text = f"{matched_user}：{forward_content}" if forward_with_name else forward_content
+            log(f"🔄 [群转发] 监控群【{src_group}】发言人【{matched_user}】: \"{forward_content}\" -> 转发至【{target_group}】")
+            send_reply_instant(hwnd, rect, layout, target_group, forward_text, allow_group=True)
+            # 注意：此处不重新抓图——send 后窗口已切到目标群，保持监控群截图供图片检测/漏读补偿使用
+            time.sleep(0.15)
+
+        # 指纹已覆盖新消息识别，无需推进游标
+
+        # 3. 图片消息降级转发（裁剪区域 OCR 提取图片内文字；表情包按尺寸过滤不转发）
+        if forward_images_as_text and img is not None:
+            image_regions = detect_image_regions(img, res, layout)
+            for region_y, region_h in image_regions:
+                if region_h < EMOJI_REGION_MAX_H:
+                    log(f"⏭️ [群转发] 检测到小尺寸表情图（高 {region_h}px < {EMOJI_REGION_MAX_H}px），按配置跳过不转发")
+                    continue
+                img_text = ocr_image_region_text(img, layout, region_y)
+                if not img_text:
+                    log(f"⏭️ [群转发] 检测到图片但 OCR 未提取到可转发文字（{src_group}），已跳过")
+                    continue
+                sig_img = (src_group, "[图片]", img_text)
+                if GROUP_FORWARD_SIGNATURE.get(sig_img):
+                    continue
+                GROUP_FORWARD_SIGNATURE[sig_img] = True
+                forward_text = f"[图片] {img_text}" if forward_with_name else img_text
+                log(f"🖼️ [群转发] 监控群【{src_group}】图片内容: \"{img_text}\" -> 转发至【{target_group}】")
+                send_reply_instant(hwnd, rect, layout, target_group, forward_text, allow_group=True)
+                time.sleep(0.15)
+
+        # 4. 限制签名表体积，防止长期运行内存膨胀
+        if len(GROUP_FORWARD_SIGNATURE) > 2000:
+            for k in list(GROUP_FORWARD_SIGNATURE.keys())[:1000]:
+                GROUP_FORWARD_SIGNATURE.pop(k, None)
+
+        # 5. 每轮仅处理一个监控群（下轮处理下一个群），并重置像素哨兵确保下轮全量扫描
+        LAST_CHAT_HASH = None
+        LAST_SIDEBAR_HASH = None
+        LAST_FULL_SCAN_TIME = 0
+        break
+
+# =============================================================================
 # 8. DAEMON MAIN LOOP
 # =============================================================================
 def main_loop():
@@ -1174,13 +1592,21 @@ def main_loop():
     log("   左轨看板: 绿色激活项背景判定 + 宽容度红点巡检")
     log("   右轨微观: 顶栏标题交叉锚定 + 贴底气泡真彩流向分析")
     log("   协同仲裁: 三元协同指纹去重，绝不漏掉任何短消息与标点")
+    log("   群转发模式: group_forward.enabled=true 时切换为群聊监控转发引擎")
     log("=" * 60)
     
     while True:
         try:
             hwnd, ver = get_wechat_hwnd()
             if hwnd:
-                scan_and_reply_wechat(hwnd)
+                cfg = load_config()
+                gf = cfg.get("group_forward") or {}
+                if gf.get("enabled"):
+                    # 群聊监控转发模式（与好友 AI 回复互斥）
+                    forward_group_messages(hwnd)
+                else:
+                    # 默认好友私聊 AI 自动回复模式
+                    scan_and_reply_wechat(hwnd)
             cfg = load_config()
             interval = cfg_float(cfg, "check_interval_seconds", 0.8)
             time.sleep(interval)
