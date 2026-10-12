@@ -886,61 +886,71 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply, allow_group=Fals
     user_orig_hwnd = user32.GetForegroundWindow()
     send_success = False
     send_unverified = False
-    
+    # 🔥 防重复：消息只注入发送一次；后续尝试仅补验（绝不重发），避免验收抖动导致同一消息发两遍
+    sent_once = False
+    img_pre = None
+
     for attempt in range(1, 3):
-        # 1. 剪贴板安全写入
-        if not safe_clipboard_copy(final_reply, retries=3, delay=0.03):
-            log(f"⚠️ [剪贴板写入受阻(尝试 {attempt}/2)] 系统剪贴板被占用，稍后重试...")
-            time.sleep(0.05)
-            continue
-        time.sleep(0.02)
-        
-        # 2. 发送前基线图像抓取 (用于差分验收)
-        img_pre, _, _ = grab_wechat_window(hwnd)
-        
-        # 3. Win32 穿透提权激活微信
-        activate_wechat(hwnd)
-        time.sleep(0.03)
-        
-        # 🔥 关键安全红线：击键前强校验前台窗口！
-        cur_fore = user32.GetForegroundWindow()
-        if cur_fore != hwnd:
-            log(f"🚫 [安全熔断(尝试 {attempt}/2)] 微信窗口未夺取到前台焦点 (当前前台HWND={cur_fore})，坚决终止按键模拟防串窗！")
-            time.sleep(0.15)
-            continue
-            
-        # 4. 动态自适应几何坐标模拟点击输入框聚焦 (0 鼠标物理移动)
-        # 根据动态高度与 input_h 计算垂直安全中心，避开底部图标栏与顶部视窗分割线
-        input_safe_y = int(cur_H - cur_layout["input_h"] * 0.55)
-        input_safe_x = int(0.55 * cur_W)
-        post_click_client_point(hwnd, input_safe_x, input_safe_y)
-        time.sleep(0.03)
-        
-        # 二次复验前台归属
-        if user32.GetForegroundWindow() != hwnd:
-            log(f"🚫 [安全熔断(尝试 {attempt}/2)] 点击输入框时光标脱失，终止击键！")
-            continue
-            
-        # 5. 极速键盘事件注入 (Ctrl+V 与 Enter)
-        try:
-            # Ctrl+V 粘贴
-            user32.keybd_event(0x11, 0, 0, 0)
-            user32.keybd_event(0x56, 0, 0, 0)
+        if not sent_once:
+            # 1. 剪贴板安全写入
+            if not safe_clipboard_copy(final_reply, retries=3, delay=0.03):
+                log(f"⚠️ [剪贴板写入受阻(尝试 {attempt}/2)] 系统剪贴板被占用，稍后重试...")
+                time.sleep(0.05)
+                continue
             time.sleep(0.02)
-            user32.keybd_event(0x56, 0, 0x0002, 0)
-            user32.keybd_event(0x11, 0, 0x0002, 0)
-            time.sleep(0.04)
-            
-            # 回车发送
-            user32.keybd_event(0x0D, 0, 0, 0)
-            time.sleep(0.02)
-            user32.keybd_event(0x0D, 0, 0x0002, 0)
-            time.sleep(0.04)
-        finally:
-            # 6. 平稳恢复用户原本的前台窗口 (坚决废除 HWND_BOTTOM 压底！)
-            if user_orig_hwnd and user_orig_hwnd != hwnd:
-                user32.SetForegroundWindow(user_orig_hwnd)
-                
+
+            # 2. 发送前基线图像抓取 (用于差分验收)
+            img_pre, _, _ = grab_wechat_window(hwnd)
+
+            # 3. Win32 穿透提权激活微信
+            activate_wechat(hwnd)
+            time.sleep(0.03)
+
+            # 🔥 关键安全红线：击键前强校验前台窗口！
+            cur_fore = user32.GetForegroundWindow()
+            if cur_fore != hwnd:
+                log(f"🚫 [安全熔断(尝试 {attempt}/2)] 微信窗口未夺取到前台焦点 (当前前台HWND={cur_fore})，坚决终止按键模拟防串窗！")
+                time.sleep(0.15)
+                continue
+
+            # 4. 动态自适应几何坐标模拟点击输入框聚焦 (0 鼠标物理移动)
+            # 根据动态高度与 input_h 计算垂直安全中心，避开底部图标栏与顶部视窗分割线
+            input_safe_y = int(cur_H - cur_layout["input_h"] * 0.55)
+            input_safe_x = int(0.55 * cur_W)
+            post_click_client_point(hwnd, input_safe_x, input_safe_y)
+            time.sleep(0.03)
+
+            # 二次复验前台归属
+            if user32.GetForegroundWindow() != hwnd:
+                log(f"🚫 [安全熔断(尝试 {attempt}/2)] 点击输入框时光标脱失，终止击键！")
+                continue
+
+            # 5. 极速键盘事件注入 (Ctrl+V 与 Enter)
+            try:
+                # Ctrl+V 粘贴
+                user32.keybd_event(0x11, 0, 0, 0)
+                user32.keybd_event(0x56, 0, 0, 0)
+                time.sleep(0.02)
+                user32.keybd_event(0x56, 0, 0x0002, 0)
+                user32.keybd_event(0x11, 0, 0x0002, 0)
+                time.sleep(0.04)
+
+                # 回车发送
+                user32.keybd_event(0x0D, 0, 0, 0)
+                time.sleep(0.02)
+                user32.keybd_event(0x0D, 0, 0x0002, 0)
+                time.sleep(0.04)
+            finally:
+                # 6. 平稳恢复用户原本的前台窗口 (坚决废除 HWND_BOTTOM 压底！)
+                if user_orig_hwnd and user_orig_hwnd != hwnd:
+                    user32.SetForegroundWindow(user_orig_hwnd)
+
+            sent_once = True
+        else:
+            # 🔥 补验阶段：消息已发送，仅延长沉降等待再抓图验收，绝不重复粘贴发送
+            log(f"⚠️ [发送闭环验收未通过(尝试 {attempt}/2)] 消息已注入但绿底增量未检出，延长沉降后补验（不重复发送）...")
+            time.sleep(0.7)
+
         # 7. 渲染沉降与严谨差分动态绿底增量闭环验收
         time.sleep(0.35) # 等待微信 Qt5 气泡动画与排版彻底沉降
         img_post, _, _ = grab_wechat_window(hwnd)
@@ -949,25 +959,37 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply, allow_group=Fals
             send_success = True
             break
         elif verdict == "UNCERTAIN":
-            log(f"⚠️ [闭环验收异常] 离屏画面抓取受阻无法比对，安全熔断终止重试以防向好友【{target}】重复发消息！")
+            log(f"⚠️ [闭环验收异常] 离屏画面抓取受阻无法比对，按已发出处理（不重发防重复）")
             send_success = True
             send_unverified = True
             break
         else:
-            log(f"⚠️ [发送闭环验收未通过(尝试 {attempt}/2)] 未检测到新长出的绿底气泡增量，执行强力二次重试...")
-            time.sleep(0.12)
-            
+            if attempt == 1 and not sent_once:
+                log(f"⚠️ [发送闭环验收未通过(尝试 {attempt}/2)] 未检测到新长出的绿底气泡增量，执行补验...")
+                time.sleep(0.12)
+            elif attempt == 1:
+                # 已发送但验收未通过 -> 进入补验轮
+                continue
+            else:
+                # 补验仍失败：消息已发出，登记"已发送未验证"，绝不重发防重复
+                send_success = True
+                send_unverified = True
+                break
+
     # 还原用户原本的剪贴板
     if user_old_clip is not None:
         safe_clipboard_copy(user_old_clip, retries=2, delay=0.02)
-        
+
     if send_success and send_unverified:
         log(f"⚠️ [发送未验证] 已按发出处理并登记防重复，但未能抓图验证好友【{target}】是否收到，请留意确认！")
     elif send_success:
         log(f"✅ [后台静默秒回成功] 已回复【{target}】！(物理鼠标 0 移动，瞬态焦点已复原)")
     else:
-        log(f"❌ [发送脱靶告警] 2 次重试后均未检测到绿底气泡增量！")
-        
+        if sent_once:
+            log(f"⚠️ [发送未验证] 消息已注入发送但绿底增量验收未通过（不再重发防重复），请留意确认！")
+            return True
+        log(f"❌ [发送脱靶告警] 消息未能注入发送！")
+
     return send_success
 
 # =============================================================================
@@ -1424,6 +1446,72 @@ def _retry_ocr_line(img, layout, y_center):
     texts = [txt.strip() for b, txt, sc in (res or []) if txt and txt.strip()]
     return "，".join(texts)
 
+# ---------------------------------------------------------------------------
+# 群转发质量护栏：乱码过滤 / 图片归属定位 / 图片内容指纹(dHash)
+# ---------------------------------------------------------------------------
+_GARBLED_VALID_RE = re.compile(r'[\u4e00-\u9fffA-Za-z0-9，。！？、；：""''（）《》、…·]')
+
+def _looks_garbled(text):
+    """判定 OCR 文本是否为识别乱码（如 "g：O" "2-00" 及大段符号噪声）。
+    正常中文/数字消息不受影响；乱码消息直接跳过不转发。"""
+    if not text:
+        return True
+    t = str(text).strip()
+    if not t:
+        return True
+    # 1) 有效字符占比过低 -> 大段乱码（如截图 OCR 噪声）
+    valid = len(_GARBLED_VALID_RE.findall(t))
+    if valid / len(t) < 0.55:
+        return True
+    # 2) 极短消息（<=3 字符）含英文字母 -> 大概率是把中文识别坏的噪声（如 "g：O"）
+    if len(t) <= 3 and re.search(r'[A-Za-z]', t):
+        return True
+    # 3) 数字+横线/斜杠的碎片（如 "2-00"）-> 识别残缺，跳过（纯数字消息如"1000"不受影响）
+    if len(t) <= 6 and re.search(r'[\-—]', t) and re.fullmatch(r'[\d\-\—\s]+', t):
+        return True
+    # 4) 中英符号混杂且含多个字母（如 "g或或交=美一/要一自己X"）-> 图片 OCR 噪声特征
+    if re.search(r'[=+/]', t) and len(re.findall(r'[A-Za-z]', t)) >= 2:
+        return True
+    return False
+
+def _image_dhash(img, layout, y_center, region_h):
+    """对图片消息区域做内容指纹（dHash + 亮度均值/标准差），
+    同一张图指纹稳定（不随 OCR 文本抖动变化），不同图片指纹不同，
+    用于防止同一图片被 OCR 出不同文本而重复转发。"""
+    x1 = layout["chat_start_x"] + 30
+    x2 = img.width - 30
+    half = max(30, min(region_h, 400) // 2)
+    y1 = max(0, y_center - half)
+    y2 = min(img.height, y_center + half)
+    if x2 <= x1 or y2 - y1 < 20:
+        return b""
+    crop = img.crop((x1, y1, x2, y2)).convert("L")
+    crop = crop.resize((9, 8), Image.Resampling.BILINEAR)
+    arr = np.asarray(crop, dtype=int)
+    bits = (arr[:, 1:] > arr[:, :-1]).tobytes()
+    # 附加区域统计特征：亮度均值+标准差（同图稳定；不同图即使差分模式退化也必不同）
+    farr = arr.astype(float)
+    mean_v = int(farr.mean()) & 0xFF
+    std_v = int(max(0.0, farr.std())) & 0xFF
+    return bytes([mean_v, std_v]) + bits
+
+def _find_image_sender(chat_bubbles, region_y):
+    """定位图片消息的发言人：取图片区域上方最近的 incoming 文本气泡的昵称。
+    微信群聊图片消息遵循"昵称行+图片"两行布局；返回 None 表示无法归属（不转发）。"""
+    best = None
+    best_y = -1
+    for pb in chat_bubbles:
+        if not pb.get("is_incoming"):
+            continue
+        ly = pb.get("last_y", 0)
+        if ly < region_y - 15 and ly > best_y:
+            best_y = ly
+            best = pb
+    if best is None:
+        return None
+    sender, _ = extract_sender_and_content(best["text"])
+    return (sender or best["text"]).strip() or None
+
 def forward_group_messages(hwnd):
     """
     群聊监控转发引擎主入口（每轮仅处理一个监控群，轮询调度）：
@@ -1519,7 +1607,12 @@ def forward_group_messages(hwnd):
                     retried = _retry_ocr_line(img, layout, pb['last_y'])
                     if retried:
                         r_sender, r_content = extract_sender_and_content(retried)
-                        forward_content = r_content or retried
+                        if r_content and r_content != matched_user:
+                            forward_content = r_content
+                        else:
+                            # 重读仍无实质内容（或只读到昵称行本身），跳过等待下轮重读
+                            log(f"⏭️ [群转发] OCR 未读取到【{matched_user}】消息内容（重读: {retried!r}），本轮跳过等待重读")
+                            continue
                     else:
                         log(f"⏭️ [群转发] OCR 未读取到【{matched_user}】消息内容（原文: {text}），本轮跳过等待重读")
                         continue
@@ -1530,6 +1623,10 @@ def forward_group_messages(hwnd):
                     continue
                 matched_user = self_nickname
                 forward_content = text
+            # 🔥 乱码过滤：OCR 识别噪声（如 "g：O" "2-00"）不转发
+            if _looks_garbled(forward_content):
+                log(f"⏭️ [群转发] 【{matched_user}】消息内容疑似 OCR 识别乱码（{forward_content!r}），跳过")
+                continue
             sig = (src_group, matched_user, forward_content)
             if GROUP_FORWARD_SIGNATURE.get(sig):
                 continue
@@ -1553,16 +1650,24 @@ def forward_group_messages(hwnd):
                 if region_h < EMOJI_REGION_MAX_H:
                     log(f"⏭️ [群转发] 检测到小尺寸表情图（高 {region_h}px < {EMOJI_REGION_MAX_H}px），按配置跳过不转发")
                     continue
-                img_text = ocr_image_region_text(img, layout, region_y)
-                if not img_text:
-                    log(f"⏭️ [群转发] 检测到图片但 OCR 未提取到可转发文字（{src_group}），已跳过")
+                # 🔥 图片归属过滤：必须能定位到图片发言人且命中监控名单才转发（杜绝群里他人图片被误转）
+                img_sender = _find_image_sender(chat_bubbles, region_y)
+                if not img_sender or not match_watch_user(img_sender, None, watch_users):
+                    log(f"⏭️ [群转发] 检测到图片但无法归属到监控名单成员（归属: {img_sender or '未知'}），跳过不转发")
                     continue
-                sig_img = (src_group, "[图片]", img_text)
+                img_text = ocr_image_region_text(img, layout, region_y)
+                if not img_text or _looks_garbled(img_text):
+                    log(f"⏭️ [群转发] 图片 OCR 未提取到有效文字（{src_group}，归属: {img_sender}），已跳过")
+                    continue
+                # 🔥 dHash 内容指纹去重：同一张图 OCR 文本抖动也不会重复转发
+                dhash = _image_dhash(img, layout, region_y, region_h)
+                sig_img = (src_group, img_sender, "[图片]", dhash)
                 if GROUP_FORWARD_SIGNATURE.get(sig_img):
+                    log(f"⏭️ [群转发] 图片内容指纹已转发过（{src_group}），跳过防重复")
                     continue
                 GROUP_FORWARD_SIGNATURE[sig_img] = True
                 forward_text = f"[图片] {img_text}" if forward_with_name else img_text
-                log(f"🖼️ [群转发] 监控群【{src_group}】图片内容: \"{img_text}\" -> 转发至【{target_group}】")
+                log(f"🖼️ [群转发] 监控群【{src_group}】发言人【{img_sender}】图片内容: \"{img_text}\" -> 转发至【{target_group}】")
                 send_reply_instant(hwnd, rect, layout, target_group, forward_text, allow_group=True)
                 time.sleep(0.15)
 
