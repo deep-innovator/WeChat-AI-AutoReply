@@ -532,12 +532,16 @@ def parse_chat_bubbles_chromatic(res, img_rgb, layout, ignored_keywords=None):
         # 严格限定在主聊天气泡区域 (顶部避开标题栏，底部避开输入工具栏)
         # 注意：微信群聊 incoming 消息是"昵称行(小字)+内容行"两行，昵称行紧贴聊天区顶部，
         # 顶部过滤必须只排除标题栏本身（header_h），否则顶部第一条消息的昵称会被误删
-        if cx > (chat_start_x + 15) and header_h < cy < (H - int(input_h * 0.70)):
+        # 🔥 左侧过滤线放宽到 chat_start_x+60：微信聊天区左侧存在 ~60px 空白边距，
+        # 该区域出现的文本（如窗口装饰残影 "X"）不是消息气泡
+        if cx > (chat_start_x + 60) and header_h < cy < (H - int(input_h * 0.70)):
             if re.match(r'^\d{1,2}:\d{2}$', c_clean) or re.match(r'^\d{1,2}/\d{2}$', c_clean) or re.match(r'^\d{4}-\d{2}-\d{2}', c_clean):
                 continue
             if c_clean in ["昨天", "前天", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日", "查看更多消息", "重新编辑", "发送"]:
                 continue
             if any(c_clean.startswith(p) for p in ["[转账]", "微信转账", "已收款", "已被接收", "￥", "你撤回了一条消息"]):
+                continue
+            if "撤回了一条消息" in c_clean:
                 continue
             if "拍了拍" in c_clean:
                 continue
@@ -558,6 +562,11 @@ def parse_chat_bubbles_chromatic(res, img_rgb, layout, ignored_keywords=None):
             
             # 真彩底色判定：绿底 100% 我发，非绿底偏左侧 100% 好友发
             is_incoming = (not has_green_bg) and (box_left < (chat_start_x + int(0.55 * (W - chat_start_x))))
+            # 🔥 低置信度 OCR 碎片过滤：微信 UI 残影/角标常被 OCR 以 <0.7 置信度误读成
+            # 单字符（如"1""X""g"），真实消息 OCR 置信度普遍 >0.8。此类碎片不参与气泡构建，
+            # 避免被并入相邻消息（如"早上好"变成"早上好，1"）。
+            if sc is not None and sc < 0.70:
+                continue
             raw_lines.append((cy, box_left, box_right, is_incoming, c_clean))
             
     raw_lines.sort(key=lambda x: x[0])
@@ -565,24 +574,31 @@ def parse_chat_bubbles_chromatic(res, img_rgb, layout, ignored_keywords=None):
     # 智能多行气泡垂直合并：
     # - 微信群聊 incoming = "昵称行(短文本) + 内容行"，间距 ~45-65px，合并为"昵称：内容"
     # - 多行内容气泡间距 <40px，合并为"文本，文本"
+    # 🔥 合并必须同时满足 x 轴对齐（|box_left 差| < 80px）：防止聊天区左侧的
+    # UI 残影/角标碎片（位置与气泡相差 100px+）被并入相邻消息
+    MERGE_X_TOLERANCE = 80
     merged_bubbles = []
     for cy, b_left, b_right, is_inc, text in raw_lines:
         if merged_bubbles and is_inc == merged_bubbles[-1]['is_incoming']:
             gap = cy - merged_bubbles[-1]['last_y']
+            x_gap = abs(b_left - merged_bubbles[-1]['box_left'])
             last_text = merged_bubbles[-1]['text']
             # 上行像昵称（短、无冒号/句号/标点）且间距在 65px 内 → 昵称：内容
-            if _looks_like_nickname(last_text) and gap < 65:
+            if _looks_like_nickname(last_text) and gap < 65 and x_gap < MERGE_X_TOLERANCE:
                 merged_bubbles[-1]['text'] = last_text + "：" + text
                 merged_bubbles[-1]['last_y'] = cy
+                merged_bubbles[-1]['box_left'] = min(merged_bubbles[-1]['box_left'], b_left)
                 continue
-            if gap < 40:
+            if gap < 40 and x_gap < MERGE_X_TOLERANCE:
                 merged_bubbles[-1]['text'] += "，" + text
                 merged_bubbles[-1]['last_y'] = cy
+                merged_bubbles[-1]['box_left'] = min(merged_bubbles[-1]['box_left'], b_left)
                 continue
         merged_bubbles.append({
             'is_incoming': is_inc,
             'first_y': cy,
             'last_y': cy,
+            'box_left': b_left,
             'text': text
         })
             
