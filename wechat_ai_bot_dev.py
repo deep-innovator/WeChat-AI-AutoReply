@@ -1368,6 +1368,20 @@ def switch_to_session(hwnd, layout, res, img, session_name):
 
     found_cand_y = _find_candidate_y()
     if found_cand_y is None:
+        # 找不到目标会话时，微信可能处于搜索/浮层等非会话列表状态
+        # （搜索框打开时左侧列表变成搜索结果页，监控群不可见）。
+        # 兜底：点击聊天区空白清理界面状态后重新抓屏再找一次。
+        log("左侧未直接找到【%s】，点击聊天区清理界面状态后重试" % session_name)
+        activate_wechat(hwnd)
+        time.sleep(0.05)
+        post_click_client_point(hwnd, int(0.5 * W), int(header_h + 100))
+        time.sleep(0.8)
+        img2, _, layout2, res2 = grab_and_ocr_wechat(hwnd)
+        if img2:
+            img, layout, res = img2, layout2, res2
+            W, H = img.size
+            found_cand_y = _find_candidate_y()
+    if found_cand_y is None:
         return False
     # 点击前必须穿透激活微信窗口——失焦时 Qt 会丢弃注入的鼠标消息
     activate_wechat(hwnd)
