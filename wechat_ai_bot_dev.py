@@ -1747,7 +1747,8 @@ def main_loop():
             if gf.get("enabled"):
                 # 群转发模式放宽轮询间隔：全屏 OCR 是 CPU 密集操作，
                 # 0.5 秒疯狂轮询会吃满 CPU 并频繁与微信窗口操作冲突。
-                interval = max(interval, 25.0)
+                # 用户要求 1 分钟一轮，转发延迟最多 60 秒，可接受。
+                interval = max(interval, 60.0)
             time.sleep(interval)
         except Exception as e:
             log(f"⚠️ [主循环未捕获异常] {e}")
