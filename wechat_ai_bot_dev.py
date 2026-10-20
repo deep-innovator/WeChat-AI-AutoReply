@@ -1744,6 +1744,10 @@ def main_loop():
                     scan_and_reply_wechat(hwnd)
             cfg = load_config()
             interval = cfg_float(cfg, "check_interval_seconds", 0.8)
+            if gf.get("enabled"):
+                # 群转发模式放宽轮询间隔：全屏 OCR 是 CPU 密集操作，
+                # 0.5 秒疯狂轮询会吃满 CPU 并频繁与微信窗口操作冲突。
+                interval = max(interval, 25.0)
             time.sleep(interval)
         except Exception as e:
             log(f"⚠️ [主循环未捕获异常] {e}")
