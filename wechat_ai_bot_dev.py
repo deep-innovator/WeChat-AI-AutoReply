@@ -4,6 +4,7 @@ import time
 import json
 import re
 import hashlib
+import datetime
 import ctypes
 from ctypes import wintypes
 import numpy as np
@@ -349,6 +350,40 @@ def activate_wechat(hwnd):
                 user32.AttachThreadInput(my_thread, wx_thread, False)
                 
         time.sleep(0.03)
+        return user32.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+def _activate_by_real_click(hwnd):
+    """
+    SendInput 真实鼠标点击微信标题栏激活前台（突破 Windows 前台锁/ASFW）：
+    - 真实鼠标点击被视为"用户输入"，Windows 允许其切换前台（SetForegroundWindow 被系统前台锁拒绝时用）
+    - 只点击标题栏（不点内容区，避免误触消息/链接）
+    - 结束后立即恢复原鼠标位置，尽量不打扰用户
+    返回是否成功激活。
+    """
+    try:
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            time.sleep(0.1)
+        rect2 = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect2))
+        if rect2.right <= rect2.left or rect2.bottom <= rect2.top:
+            return False
+        cx = (rect2.left + rect2.right) // 2
+        cy = rect2.top + max(8, int(0.03 * (rect2.bottom - rect2.top)))
+        pt_orig = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt_orig))
+        # 点击点必须属于微信窗口（防止其他窗口遮挡时误点到上层窗口）
+        if user32.WindowFromPoint(wintypes.POINT(cx, cy)) != hwnd:
+            return False
+        user32.SetCursorPos(cx, cy)
+        time.sleep(0.02)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+        time.sleep(0.02)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+        time.sleep(0.05)
+        user32.SetCursorPos(pt_orig.x, pt_orig.y)  # 恢复鼠标位置
         return user32.GetForegroundWindow() == hwnd
     except Exception:
         return False
@@ -918,8 +953,13 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply, allow_group=Fals
             # 2. 发送前基线图像抓取 (用于差分验收)
             img_pre, _, _ = grab_wechat_window(hwnd)
 
-            # 3. Win32 穿透提权激活微信
-            activate_wechat(hwnd)
+            # 3. Win32 穿透提权激活微信；若被系统前台锁拒绝（如系统进程占据前台），
+            #    改用 SendInput 真实鼠标点击微信标题栏激活（真实点击=用户输入，可突破前台锁）
+            if user32.GetForegroundWindow() != hwnd:
+                activate_wechat(hwnd)
+            time.sleep(0.03)
+            if user32.GetForegroundWindow() != hwnd:
+                _activate_by_real_click(hwnd)
             time.sleep(0.03)
 
             # 🔥 关键安全红线：击键前强校验前台窗口！
@@ -1272,11 +1312,13 @@ def scan_and_reply_wechat(hwnd):
 #     图片消息降级方案：裁剪图片区域 OCR 提取图片内文字后转发
 # =============================================================================
 GROUP_FORWARD_SIGNATURE = {}
-# 每个监控群已见气泡文本指纹集合 + 基线标记：
-# 指纹方案不依赖滚动位置（游标方案在窗口滚动时会漏掉中部新消息），
-# 每轮对比屏幕气泡文本，出现新文本即新消息；滚动重复看到的旧文本自动跳过。
+# 60s 短窗口去重：同一归属+同一内容（或同一图片指纹）在 60 秒内只转发一次，
+# 防止同一条消息被滚动重扫 / 时间行解析波动而重复转发。
+GROUP_FORWARD_LAST = {}
 GROUP_FORWARD_SEEN = {}
-GROUP_FORWARD_INIT = {}
+# 启动基线（按群）：{src_group: set((is_incoming, text))}，守护首次 OCR 到某群时记录屏上存量消息，
+# 仅用于时间行漏读（msg_dt=None）时判定该消息是否为首见前的历史消息
+GROUP_FORWARD_BASELINE = {}
 
 # 表情消息过滤：小于该高度的无文本区域视为表情包，不转发（微信图片消息通常更高）
 EMOJI_REGION_MAX_H = 130
@@ -1542,6 +1584,126 @@ def _find_image_sender(chat_bubbles, region_y):
     sender, _ = extract_sender_and_content(best["text"])
     return (sender or best["text"]).strip() or None
 
+# =============================================================================
+# 7.5.1 群转发时间戳去重（替代"基线吞历史消息"防刷屏机制）
+#   - DAEMON_START: 守护进程启动时刻，之后发送的消息才视为新消息
+#   - 每条气泡从 OCR 结果中提取其上方最近的微信时间行（如 8:40 / 8:08 AM / 昨天）
+#   - 消息发送时间 > DAEMON_START → 新消息 → 转发；否则为历史消息 → 不转发
+#   - 时间解析失败（OCR 未读到时间行）→ 用内容指纹兜底：从未见过即视为新消息
+# =============================================================================
+DAEMON_START = datetime.datetime.now()
+
+_TIME_RE = re.compile(r'^\s*(\d{1,2}):(\d{2})\s*(上午|下午|AM|PM)?\s*$', re.I)
+_WEEKDAY_CN = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+
+
+def _parse_time_line_to_dt(txt, now=None):
+    """微信消息时间文本 -> datetime。解析失败返回 None。"""
+    if now is None:
+        now = datetime.datetime.now()
+    txt = str(txt).strip()
+    m = _TIME_RE.match(txt)
+    if m:
+        h = int(m.group(1))
+        minute = int(m.group(2))
+        ap = (m.group(3) or "").upper()
+        if ap == "PM" or ap == "下午":
+            if h != 12:
+                h += 12
+        elif ap == "AM" or ap == "上午":
+            if h == 12:
+                h = 0
+        # 无 AM/PM：电脑微信按 24h 制显示（实测 "7:59"/"8:40"），直接按数字
+        return now.replace(hour=h, minute=minute, second=0, microsecond=0)
+    if "昨天" in txt:
+        return now - datetime.timedelta(days=1)
+    m2 = re.match(r'^\s*(\d{2,4})/(\d{1,2})/(\d{1,2})\s*$', txt)
+    if m2:
+        try:
+            # 电脑微信日期格式为 年/月/日（如 26/10/13 = 2026-10-13）
+            y, mo, d = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
+            yy = y + 2000 if y < 100 else y
+            return datetime.datetime(yy, mo, d)
+        except Exception:
+            return None
+    if txt.startswith("星期"):
+        try:
+            wd = _WEEKDAY_CN.get(txt[2], -1)
+            if wd >= 0:
+                delta = (now.weekday() - wd) % 7
+                return (now - datetime.timedelta(days=delta)).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+        except Exception:
+            return None
+    return None
+
+
+def _extract_bubble_time(res, layout, bubble_y):
+    """返回气泡上方最近时间行的 datetime（解析失败返回 None）。"""
+    best = None
+    for b, txt, sc in (res or []):
+        xs = [pt[0] for pt in b]
+        ys = [pt[1] for pt in b]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        if cx < layout["chat_start_x"] or cy >= bubble_y or cy < layout["header_h"]:
+            continue
+        if not _TIME_RE.match(str(txt).strip()):
+            continue
+        if best is None or cy > best[0]:
+            best = (cy, txt.strip())
+    if best is None:
+        return None
+    return _parse_time_line_to_dt(best[1])
+
+
+def _chat_region_hash(img, layout):
+    """计算微信聊天区消息区域感知哈希（像素哨兵：画面无变化则不 OCR，省 25s/轮）。"""
+    W, H = img.size
+    x1 = max(330, int(layout["chat_start_x"] + 10))
+    y1 = max(0, int(layout["header_h"] + 10))
+    x2 = min(W, int(W - 5))
+    y2 = min(H, int(H - int(layout["input_h"] * 0.70)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    patch = np.array(img)[y1:y2, x1:x2]
+    return hashlib.md5(patch.tobytes()).hexdigest()
+
+
+# 像素哨兵 2.0：聊天区缩略图 + 像素差均值（排除输入框光标闪烁等微小抖动）
+LAST_CHAT_PATCH = None
+_CHAT_DIFF_THRESHOLD = 1.6  # 平均像素差阈值：低于此视为无实质变化（光标闪烁/亚像素抖动）
+
+
+def _chat_region_diff(img, layout):
+    """返回 (聊天区缩略图, 与上次的像素差均值)。LAST_CHAT_PATCH 为 None（首轮）时视为有变化。"""
+    global LAST_CHAT_PATCH
+    W, H = img.size
+    x1 = max(330, int(layout["chat_start_x"] + 10))
+    y1 = max(0, int(layout["header_h"] + 10))
+    x2 = min(W, int(W - 5))
+    y2 = min(H, int(H - int(layout["input_h"] * 1.0) - 5))  # 完全排除输入框（光标闪烁区）
+    if x2 <= x1 or y2 <= y1:
+        return None, None
+    patch = np.array(img)[y1:y2, x1:x2]
+    small = np.array(
+        Image.fromarray(patch).convert("L").resize((32, 24), Image.Resampling.BILINEAR),
+        dtype=int,
+    )
+    if LAST_CHAT_PATCH is None:
+        LAST_CHAT_PATCH = small
+        return small, None  # 首轮：视为变化，必须 OCR
+    diff = float(np.abs(small - LAST_CHAT_PATCH).mean())
+    LAST_CHAT_PATCH = small
+    return small, diff
+
+
+def _sidebar_region_hash(img, layout):
+    """计算微信左侧会话列表区域感知哈希（像素哨兵用）。"""
+    arr = np.array(img)
+    return hashlib.md5(arr[:, : layout["chat_start_x"]].tobytes()).hexdigest()
+
+
 def forward_group_messages(hwnd):
     """
     群聊监控转发引擎主入口（每轮仅处理一个监控群，轮询调度）：
@@ -1570,10 +1732,27 @@ def forward_group_messages(hwnd):
         log("⚠️ [群转发] 配置不完整：需同时填写 source_groups / watch_users / target_group，当前已跳过")
         return
 
-    img, rect, layout, res = grab_and_ocr_wechat(hwnd)
-    if not img or not res:
+    # 像素哨兵：先抓屏计算聊天区像素差，画面无实质变化则跳过 OCR（PP-OCRv6 medium 全屏 OCR 约 25s，避免每轮满载）
+    img, rect, scale = grab_wechat_window(hwnd)
+    if not img:
         return
+    layout = compute_wechat_layout(img.width, img.height)
+    chat_small, chat_diff = _chat_region_diff(img, layout)
+    if chat_diff is not None and chat_diff < _CHAT_DIFF_THRESHOLD:
+        return  # 画面无实质变化：不 OCR，本轮结束（CPU 近零）
+    # 有变化才 OCR（下采样至 1000 宽加速，坐标映射回原图）
     W, H = img.size
+    dr = 1000.0 / W if W > 1100 else 1.0
+    if dr < 1.0:
+        im2 = img.resize((int(W * dr), int(H * dr)), Image.Resampling.BILINEAR)
+        res_raw, _ = ocr_engine(im2)
+        res = []
+        for b, txt, sc in (res_raw or []):
+            res.append(([[pt[0] / dr, pt[1] / dr] for pt in b], txt, sc))
+    else:
+        res, _ = ocr_engine(img)
+    if not res:
+        return
 
     for src_group in source_groups:
         # 1. 确保当前窗口为该监控群（切换后二次验证顶栏，防点击失败误读其他会话）
@@ -1596,26 +1775,37 @@ def forward_group_messages(hwnd):
         if not chat_bubbles:
             continue
 
-        # 首次运行（或重启后）：建立文本指纹基线，只记录当前屏幕所有气泡，不转发历史消息防刷屏
+        # 启动基线（按群）：守护进程首次 OCR 到该群时，记录屏上存量消息指纹。
+        # 仅用于「时间行 OCR 漏读（msg_dt=None）」时的旧消息兜底判定：基线内=首见时屏上存量，视为历史消息不转发；
+        # 新消息只要时间行可读（msg_dt > DAEMON_START）就直接转发，不受基线影响（不吞新消息）。
+        baseline = GROUP_FORWARD_BASELINE.setdefault(src_group, set())
+        if not baseline:
+            for _pb in chat_bubbles:
+                _t = str(_pb['text']).strip()
+                if _t:
+                    baseline.add((_pb['is_incoming'], _t))
+        # 时间去重：新消息 = 发送时间晚于守护启动（替代"基线吞历史消息"防刷屏）
+        # 时间解析失败的消息用启动基线兜底（基线内=旧消息不转，不在基线=新消息转发）
         seen = GROUP_FORWARD_SEEN.setdefault(src_group, set())
-        if src_group not in GROUP_FORWARD_INIT:
-            GROUP_FORWARD_INIT[src_group] = True
-            for pb in chat_bubbles:
-                t = pb['text'].strip()
-                if t:
-                    seen.add(t)
-            log(f"📌 [群转发] 监控群【{src_group}】指纹基线已建立（{len(seen)} 条已见消息），之后的新消息才会转发")
-            break
-
-        # 本轮新气泡 = 指纹未见过（含自己发的绿泡；滚动重复看到的旧文本自动跳过）
         new_bubbles = []
         for pb in chat_bubbles:
             t = pb['text'].strip()
             if not t:
                 continue
-            if t in seen:
+            msg_dt = _extract_bubble_time(res, layout, pb['last_y'])
+            if msg_dt is not None:
+                if msg_dt <= DAEMON_START:
+                    continue  # 守护启动前的历史消息（含重启前屏幕存量）不转发
+            else:
+                # 时间行 OCR 漏读：查启动基线，基线内视为首见时的存量旧消息，不转发
+                if (pb['is_incoming'], t) in baseline:
+                    continue
+            pb['_msg_dt'] = msg_dt
+            # 跨轮指纹：同一发送时间+同内容视为同一条（滚动重复不重复转）；时间解析失败用内容兜底
+            key = (str(msg_dt) if msg_dt else "?", pb['is_incoming'], t)
+            if key in seen:
                 continue
-            seen.add(t)
+            seen.add(key)
             new_bubbles.append(pb)
         new_bubbles.sort(key=lambda x: x['last_y'])
 
@@ -1657,7 +1847,14 @@ def forward_group_messages(hwnd):
             if _looks_garbled(forward_content):
                 log(f"⏭️ [群转发] 【{matched_user}】消息内容疑似 OCR 识别乱码（{forward_content!r}），跳过")
                 continue
-            sig = (src_group, matched_user, forward_content)
+            # 60s 短窗口去重：同归属+同内容 60 秒内只转发一次（防滚动重扫/时间行波动重复转发）
+            lk = (src_group, matched_user, forward_content)
+            _now_t = time.time()
+            if GROUP_FORWARD_LAST.get(lk) and (_now_t - GROUP_FORWARD_LAST[lk]) < 60.0:
+                log(f"⏭️ [群转发] 【{matched_user}】消息 60s 内已转发过（{forward_content!r}），跳过防重复")
+                continue
+            GROUP_FORWARD_LAST[lk] = _now_t
+            sig = (src_group, matched_user, forward_content, str(pb.get('_msg_dt') or ""))
             if GROUP_FORWARD_SIGNATURE.get(sig):
                 continue
             # 表情消息过滤：纯表情占位（如 [表情] [微笑] [动画表情]）不转发
@@ -1691,7 +1888,15 @@ def forward_group_messages(hwnd):
                     continue
                 # 🔥 dHash 内容指纹去重：同一张图 OCR 文本抖动也不会重复转发
                 dhash = _image_dhash(img, layout, region_y, region_h)
-                sig_img = (src_group, img_sender, "[图片]", dhash)
+                img_dt = _extract_bubble_time(res, layout, region_y)
+                # 图片 60s 短窗口去重（同图指纹 60 秒内只转发一次）
+                lk_img = (src_group, img_sender, "[图片]", dhash)
+                _now_t = time.time()
+                if GROUP_FORWARD_LAST.get(lk_img) and (_now_t - GROUP_FORWARD_LAST[lk_img]) < 60.0:
+                    log(f"⏭️ [群转发] 【{img_sender}】图片 60s 内已转发过，跳过防重复")
+                    continue
+                GROUP_FORWARD_LAST[lk_img] = _now_t
+                sig_img = (src_group, img_sender, "[图片]", dhash, str(img_dt or ""))
                 if GROUP_FORWARD_SIGNATURE.get(sig_img):
                     log(f"⏭️ [群转发] 图片内容指纹已转发过（{src_group}），跳过防重复")
                     continue
@@ -1705,11 +1910,12 @@ def forward_group_messages(hwnd):
         if len(GROUP_FORWARD_SIGNATURE) > 2000:
             for k in list(GROUP_FORWARD_SIGNATURE.keys())[:1000]:
                 GROUP_FORWARD_SIGNATURE.pop(k, None)
+        if len(GROUP_FORWARD_LAST) > 2000:
+            for k in list(GROUP_FORWARD_LAST.keys())[:1000]:
+                GROUP_FORWARD_LAST.pop(k, None)
 
-        # 5. 每轮仅处理一个监控群（下轮处理下一个群），并重置像素哨兵确保下轮全量扫描
-        LAST_CHAT_HASH = None
-        LAST_SIDEBAR_HASH = None
-        LAST_FULL_SCAN_TIME = 0
+        # 5. 每轮仅处理一个监控群（下轮处理下一个群）；不重置哨兵——转发后窗口已切走/画面自然变化，
+        #    画面无变化时跳过 OCR 省 CPU（像素哨兵生效）
         break
 
 # =============================================================================
